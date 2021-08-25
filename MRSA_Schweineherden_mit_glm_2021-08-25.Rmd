@@ -1,0 +1,539 @@
+---
+title: "MRSA Klassifizierung in Schweinemastherden mit *glm*"
+author: "Dr. Robert Opitz"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+     reference_docx: "BfR-styles-reference.docx"
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Der MRSA-Datensatz in Schweinemastherden wurde von Fromm *et al.* in PVM, **117**, 2014 veröffentlicht. Es handelt sich dabei um eine Metastudie. Diese wurde mittels logistischer Regression und generalized estiamtion equations ausgewertet. Es wurde eine Variablenselektion durch geführt: (i) durch univariates filtern (mit logistischer Regression) wurden alle Variablen entfernt, die keinen direkten Einfluss auf die Zielvariable haben, (ii) von paarweise korrelierten Variablen wurde eine der korrelierten Variablen entfernt. Es wurde versucht auch Interaktionsterme zubreücksichtigen. Es wurde nur einer gefunden, auch aufgrund der Anzahl der Datenpunkte Datensatzes. Dieser wurde im finalen Modell nicht weiter berücksichtigt.  
+
+# Notwendige Pakte und eigene Funktionen
+
+Hier verwendete Pakete.
+```{r libraries, warning=FALSE, message=FALSE}
+library(magrittr)
+library(caret)
+```
+
+Einige Hilfsfunktionen zum Plotten usw..
+
+```{r other_functions}
+plot_func <- function(model_fit_response, reference, title = "") 
+{
+  lev <- levels(reference)
+  neg <- lev[1]; pos <- lev[2] # negative and positive class label
+  
+  # compute accuracy, sensitivity, specificity, balancec accuracy 
+  # for all thresholds
+  threshold <- seq(0, 1, 0.01)
+  n <- length(threshold)
+  acc <- rep(NA, n)
+  sen <- rep(NA, n)
+  spe <- rep(NA, n)
+  bacc <- rep(NA, n)
+  for (i in seq(n)) 
+  {
+    pred_class <- factor(ifelse(model_fit_response <= threshold[i], 
+                                neg, pos),
+                         levels = lev)
+    acc[i] <- mean(reference == pred_class)
+    sen[i] <- mean(reference[reference == pos] == pred_class[reference == pos])
+    spe[i] <- mean(reference[reference != pos] == pred_class[reference != pos])
+    bacc[i] <- 0.5 * (sen[i] + spe[i])
+  }
+
+  # dependece of Acc, Sen, Spe, and bal. Acc of Threshold;
+  # Threshold dependence
+  plot(threshold, acc, 
+       type = "l",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       ylab = "Acc/Sen/Spe/bal. Acc",
+       main = title)
+  lines(threshold, sen,  col = "red")
+  lines(threshold, spe,  col = "blue")
+  lines(threshold, bacc, col = "green")
+  abline(v = 0.5, lty = 4)
+  cat("Max. Acc = ", max(acc), 
+      " at Threshold = ", threshold[which.max(acc)], "\n")
+  abline(v = thres <- threshold[which.max(bacc)], lty = 2)
+  cat("Max. bal. Acc = ", max(bacc), " at Threshold = ", thres, "\n")
+  # no information criteria
+  tmp <- summary(reference)
+  no_info <- max(tmp) / sum(tmp)
+  abline(h = no_info, lty = 3)
+
+  # Receiver Operating Curve
+  plot(1 - spe, sen, 
+       type = "l", 
+       main = paste("ROC", title), 
+       lwd = 5)
+  abline(a = 0, b = 1, lty = 2)
+  abline(a = 1, b = -1, lty = 3)
+
+  print(pROC::roc(reference, model_fit_response))
+
+  # Youden's J curve
+  plot(1 - spe, sen + spe - 1,
+       ylim = c(0,1),
+       type = "l",
+       ylab = "J = sen + spe - 1",
+       main = paste("Youden's J", title), 
+       lwd = 5)
+  abline(a = 1, b = -1, lty = 2)
+  max_youden_j <- which.max(sen + spe - 1)
+  cat("max. Youden's J = ", sen[max_youden_j] + spe[max_youden_j] - 1, " ",
+      "Sen = ", sen[max_youden_j], ";",
+      "Spe = ", spe[max_youden_j], ";",
+      "threshold = ", threshold[max_youden_j], "\n")
+  abline(v = 1 - spe[max_youden_j], lty = 3)
+  
+  return(thres)
+}
+
+get_and_plot_feature_frequencies <- function(feature_list, 
+                                             my_formula, 
+                                             input_data) 
+{
+  term_list <- vector( mode = 'list', length = length(feature_list) )
+  all_term_names <- colnames( model.matrix( my_formula, 
+                                            data = input_data ) )
+
+  for (i in seq_along(term_list))
+    term_list[[i]] <- which( all_term_names %in% feature_list[[i]] )
+
+  test <- rep( 0, length( all_term_names ) )
+  for (x in term_list)
+    test[ x ] <- test[ x ] + 1
+  
+  plot( sort(test/length(term_list), decreasing = TRUE),
+        type = 'h',
+        xlab = 'term', 
+        ylab = 'frequency')
+
+  abline( h = 0.9, lty = 2 )
+
+  df_result <- data.frame(term_counts = test, 
+                          frequency = test/length(term_list), 
+                          term_name = all_term_names)
+  df_result <- df_result[order(df_result$frequency, 
+                               decreasing = TRUE),]
+
+  return(df_result)
+}
+
+plot_weights_of_feature <- function(weights_list, feature_name){
+  weights <- sapply(weights_list, 
+                    function(x, feature_name) x[feature_name,], feature_name)
+  hist(weights,
+       main = paste("Weight distribution for", feature_name),
+       breaks = 100,
+       probability = TRUE)
+  invisible(NULL)
+}
+```
+
+# Datenvorbereitung
+
+## Einlesen und Vorbereiten der Daten.
+
+Einlesen und Bereinigung der Daten. Es wird sichergestellt, dass alle Daten einen R-konformen Namen haben und als Faktoren vorliegen. die Variablennamen erhalten die Namen aus dem Paper.
+Einige der Kategorien der Variablen werden besser lesbar gestaltet.
+
+```{r read_data}
+MRSA_schweineherden <- read.csv(file = file.choose(),
+                                header = TRUE)
+
+# all categorigal variables needs to be checked if there name is valid in R
+# E. g.: TRUE and FALSE are not; TRUE. and FALSE. are
+# All categorical Variables need to be (at least) described as factors
+for (i in seq_len(ncol(MRSA_schweineherden))) 
+{
+  MRSA_schweineherden[[i]] <- make.names(MRSA_schweineherden[[i]])
+  MRSA_schweineherden[[i]] <- factor(MRSA_schweineherden[[i]])
+}
+
+# the old names in the data set are renamed, so they match the names in the paper
+new_col_names <- list(HerdMRSA                = 'HERD_MRSA',
+                      HerdTypeNum             = 'HERD_TYPE',
+                      FeedingPlacesMinGrouped = 'HERD_SIZE',
+                      PurchaseBin             = 'PURCHASE',
+                      AntibioticsFrom10W      = 'AM_DRUG',
+                      AllInAllOut             = 'ALL_IN_or_OUT',
+                      Cleanup                 = 'CLEAN_UP',
+                      Disinfection            = 'DISINFECTION',
+                      SlattedFloor            = 'SLATTED',
+                      OrganicFarm             = 'ORGANIC',
+                      OtherLivestockAtFarmBin = 'OTHER_LIVESTOCK',
+                      CompanionAnimalsBin     = 'COMPANION',
+                      IndoorHousing           = 'INDOOR' )
+
+# rename the column names
+column_names <- colnames(MRSA_schweineherden)
+for (col_name in column_names)
+  colnames(MRSA_schweineherden)[column_names == col_name] <- new_col_names[[col_name]]
+
+# replace old variable types for variable HERD_SIZE
+levels(MRSA_schweineherden$HERD_SIZE)
+levels(MRSA_schweineherden$HERD_SIZE) <- c('huge', 'small', 'large', 'medium')
+# reorder factors
+MRSA_schweineherden$HERD_SIZE <- factor(MRSA_schweineherden$HERD_SIZE, 
+                                        levels = c('small', 'medium', 
+                                                   'large', 'huge'),
+                                        ordered = TRUE)
+levels(MRSA_schweineherden$HERD_SIZE)
+
+levels(MRSA_schweineherden$HERD_TYPE)
+levels(MRSA_schweineherden$HERD_TYPE) <- c("farrow", "grower", "weaner")
+levels(MRSA_schweineherden$HERD_TYPE)
+
+# replace old variable types for variable SLATTED_AT_LEAST_PARTIALLY
+levels(MRSA_schweineherden$SLATTED)
+levels(MRSA_schweineherden$SLATTED) <- c('no', 'yes')
+levels(MRSA_schweineherden$SLATTED)
+```
+
+## Vorstellung des Datensatzes (EDA)
+
+```{r print_head}
+str(MRSA_schweineherden)
+```
+
+Bestimmung der Anzahl der Datenpunkte, Anzahl Variablen und Verteilung der Response.
+
+```{r print_EDA}
+MRSA_schweineherden$HERD_MRSA %>% length -> number_of_datapoints
+MRSA_schweineherden[1,-1] %>% length -> number_of_variables
+MRSA_schweineherden$HERD_MRSA %>% summary
+MRSA_schweineherden$HERD_MRSA %>% summary  %>% pie(.,main = 'HERD MRSA')
+```
+
+Datenpunkte=`r number_of_datapoints`, Variablen=`r number_of_variables`.
+
+```{r mosaic_plot, echo=FALSE}
+par(mfrow = c(3,4))
+
+column_names <- colnames(MRSA_schweineherden)
+write_ylabel <- TRUE
+m <- 1
+for (i in seq(2,13)) {
+   tmp <- cbind.data.frame( x = MRSA_schweineherden[[i]],
+                            y = MRSA_schweineherden$HERD_MRSA )
+   
+   tmp <- table( tmp )
+
+   if ( write_ylabel )
+      ylabel <- 'MRSA'
+   else
+      ylabel <- ''
+
+   mosaicplot( tmp,
+               main = column_names[i],
+               ylab = ylabel,
+               xlab = '',
+               color = c('white','red'))
+   
+   m <- m + 1
+   if (m == 5) {
+      m <- 1
+      write_ylabel <- TRUE
+   }else{
+      write_ylabel <- FALSE
+   }
+}
+```
+
+```{r near zero Variance}
+nearZeroVar(MRSA_schweineherden, saveMetrics = TRUE)
+```
+
+Die Variable INDOOR besteht fast ausschließlich aus Herden, die indoor leben, fast keine die outdoor sind. Dadurch haben wir eine near-zero-variance (nzv) für diese Variable. Wir entfernen diese Variable daher.
+
+```{r remove Indoor}
+MRSA_schweineherden_reduced <- MRSA_schweineherden
+MRSA_schweineherden_reduced$INDOOR <- NULL
+```
+
+# Erstes Modell
+
+```{r erstes modell}
+first_model <- glm(HERD_MRSA ~ .,
+                   data = MRSA_schweineherden_reduced,
+                   family = binomial(link = "logit"))
+
+pred_prob <- predict(first_model, type = "response")
+pred_class <- ifelse(pred_prob <= 0.54, "negative", "positive")
+table(pred_class)
+table(MRSA_schweineherden_reduced$HERD_MRSA)
+confusionMatrix(data = factor(pred_class),
+                reference = MRSA_schweineherden_reduced$HERD_MRSA,
+                positive = "positive")
+plot_func(pred_prob, MRSA_schweineherden_reduced$HERD_MRSA)
+hist(pred_prob, 
+     xlim = c(0,1), 
+     breaks = 25,
+     main = "predicted MRA risk for training data",
+     xlab = "P(HERD_MRSA = positive)")
+```
+
+# Kreuzvalidierung
+
+```{r Erstellung_des_CV_trainingsindexes}
+train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+                                k = 10,
+                                times = 100 )
+```
+
+```{r CV}
+trained_models <- lapply(train_index,
+                         function(this_index)
+                         {
+                           df_train <- MRSA_schweineherden_reduced[this_index,]
+                           trained_model <- glm(HERD_MRSA ~ .,
+                                                data = df_train,
+                                                family = binomial(link = "logit"))
+                           trained_model
+                         })
+# get predicted probabilities
+pred_prob <- mapply(function(trained_model, train_data)
+                    {
+                      df_test <- MRSA_schweineherden_reduced[-train_data,]
+                      predict(trained_model,
+                              newdata = df_test,
+                              type = "response")
+                    }, trained_models, train_index)
+pred_prob <- unlist(pred_prob)
+# get references classes of test data
+ref_class <- unlist(lapply(train_index, 
+                    function(x) MRSA_schweineherden_reduced$HERD_MRSA[-x]))
+# plot everything for test data
+plot_func(pred_prob, ref_class)
+```
+
+# Take a closer look -- predicted distribution of risk, and its parts
+
+Plot the probaility calibration curve
+
+```{r calibration curve test data}
+df_cal <- data.frame(Class = ref_class)
+df_cal$glm <- pred_prob
+cal_obj <- caret::calibration(Class ~ glm,
+                              data = df_cal,
+                              cuts = 50,
+                              class = "positive")
+plot(cal_obj)
+```
+
+Some helper functions to startify the predicted risk.
+
+```{r helper functions predicted risk distribution}
+my_subset <- function(df_input, selection_rule)
+{
+  selected_col   <- selection_rule[1]
+  selected_value <- selection_rule[2]
+  df_output <- NULL
+  for (i in seq_len(nrow(df_input)))
+  {
+    if (df_input[i,selected_col] == selected_value)
+      df_output <- rbind.data.frame(df_output,
+                                    df_input[i,])
+  }
+  if (!is.null(df_output))
+    colnames(df_output) <- colnames(df_input)
+  df_output
+}
+
+get_risk_subset <- function(df_input, trained_models, 
+                            train_index, subset_list)
+{
+  result <- mapply(function(trained_model, train_data)
+                   {
+                      df_test <- df_input[-train_data,]
+                      for (this_subset in subset_list)
+                      {
+                        df_test <- my_subset(df_test, this_subset)
+                        if (is.null(df_test))
+                          return(NULL)
+                      }
+                      predict(trained_model,
+                              newdata = df_test,
+                              type = "response")
+                    }, trained_models, train_index)
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r predicted risk distribution}
+# original distribution of predicted risk
+org_hist <- hist(pred_prob,
+                 breaks = -1*Reduce("-", range(pred_prob))/0.01,
+                 plot = FALSE)
+
+sub_dist_A <- get_risk_subset(MRSA_schweineherden_reduced,
+                              trained_models, train_index,
+                              list(c("HERD_SIZE", "small"),
+                                   c("SLATTED", "yes")))
+
+sub_dist_B <- get_risk_subset(MRSA_schweineherden_reduced,
+                              trained_models, train_index,
+                              list(c("HERD_SIZE", "small"),
+                                   c("SLATTED", "no")))
+
+# distribution of stratified sample
+sub_dist_A_hist <- hist(sub_dist_A,
+                        breaks = -1*Reduce("-", range(sub_dist_A))/0.01,
+                        plot = FALSE)
+sub_dist_B_hist <- hist(sub_dist_B,
+                        breaks = -1*Reduce("-", range(sub_dist_B))/0.01,
+                        plot = FALSE)
+# plot it all
+plot(org_hist,
+     freq = TRUE,
+     col = rgb(0,0,1,1/4),
+     xlim = c(0,1),
+     xlab = "P(Y=1)",
+     main = "GLM")
+plot(sub_dist_A_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(1,0,0,1/4))
+plot(sub_dist_B_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(0,1,0,1/4))
+legend("topleft",
+       legend = c("complete",
+                  "small HERDs, SLATTED floor",#"sub_dist_A",
+                  "small HERDs, no SLATTED floor"),#"sub_dist_B"),
+       col = c(rgb(0,0,1,1/4),
+               rgb(1,0,0,1/4),
+               rgb(0,1,0,1/4)),
+       lty = 1, lwd = 4)
+```
+
+# Change in predicted risk distribution
+
+```{r helper function change in predicted risk distribution}
+get_mod_pred_risk <- function(df_input, trained_models, 
+                              train_index, subset_list)
+{
+  col_name <- subset_list[1]
+  new_value <- subset_list[2]
+  result <- mapply(function(trained_model, train_data)
+                   {
+                      df_test <- df_input[-train_data,]
+                      lev <- levels(df_test[[col_name]])
+                      df_test[,col_name] <- factor(rep(new_value, 
+                                                       nrow(df_test)),
+                                                   levels = lev)
+                      pred <- predict(trained_model,
+                                      newdata = df_test,
+                                      type = "response")
+                    }, trained_models, train_index)
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r predicted change in risk distribution}
+# original distribution of predicted risk
+org_hist <- hist(pred_prob,
+                 breaks = -1*Reduce("-", range(pred_prob))/0.01,
+                 plot = FALSE)
+
+sub_dist_A <- get_mod_pred_risk(MRSA_schweineherden_reduced,
+                                trained_models, train_index,
+                                c("SLATTED", "no"))
+
+# distribution of stratified sample
+sub_dist_A_hist <- hist(sub_dist_A,
+                        breaks = -1*Reduce("-", range(sub_dist_A))/0.01,
+                        plot = FALSE)
+
+# plot it all
+plot(org_hist,
+     freq = TRUE,
+     col = rgb(0,0,1,1/4),
+     xlim = c(0,1),
+     xlab = "P(Y=1)",
+     main = "predicted risk for GLM")
+plot(sub_dist_A_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(1,0,0,1/4))
+legend("topleft",
+       legend = c("unchanged",
+                  "no SLATTED floors"),#"sub_dist_A",
+       col = c(rgb(0,0,1,1/4),
+               rgb(1,0,0,1/4)),
+       lty = 1, lwd = 4)
+```
+
+# Change in Predicted Prevalence
+
+```{r helper function prediciting change in prevalence}
+get_mod_pred_prev <- function(df_input, trained_models, 
+                                     train_index, subset_list, threshold)
+{
+  col_name <- subset_list[1]
+  new_value <- subset_list[2]
+  result <- mapply(function(trained_model, train_data)
+                   {
+                      df_test <- df_input[-train_data,]
+                      lev <- levels(df_test[[col_name]])
+                      df_test[,col_name] <- factor(rep(new_value, 
+                                                       nrow(df_test)),
+                                                   levels = lev)
+                      pred <- predict(trained_model,
+                                      newdata = df_test,
+                                      type = "response")
+                      ifelse(pred > threshold, 1, 0)
+                    }, trained_models, train_index)
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r prediciting change in prevalence}
+pred_prev <- mapply(function(trained_model, train_data)
+                    {
+                      df_test <- MRSA_schweineherden_reduced[-train_data,]
+                      pred <- predict(trained_model,
+                                      newdata = df_test,
+                                      type = "response")
+                      ifelse(pred > 0.51, 1, 0)
+                    }, trained_models, train_index)
+pred_prev <- mean(unlist(pred_prev))
+
+mod_pred_prev <- get_mod_pred_prev(MRSA_schweineherden_reduced, 
+                                   trained_models,
+                                   train_index,
+                                   c("SLATTED", "no"),
+                                   0.51)
+mod_pred_prev <- mean(mod_pred_prev)
+```
+
+```{r plot predicted change in prevalence}
+obs_prev <- mean(MRSA_schweineherden_reduced$HERD_MRSA == "positive")
+pie(c(1 - obs_prev, obs_prev),
+    labels = c("negative", "positive"),
+    main = 'observed MRSA prevalence')
+pie(c(1 - pred_prev, pred_prev), 
+    labels = c("negative", "positive"),
+    main = 'predicted MRSA prevalence')
+pie(c(1 - mod_pred_prev, mod_pred_prev), 
+    labels = c("negative", "positive"),
+    main = 'pred. no SLATTED prevalence')
+```
+

@@ -1,0 +1,175 @@
+---
+title: "MRSA Klassifizierung in Schweinemastherden mit *evtree*"
+author: "Dr. Robert Opitz"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+     reference_docx: "BfR-styles-reference.docx"
+  html_document: default
+#editor_options:
+#  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Der MRSA-Datensatz in Schweinemastherden wurde von Fromm *et al.* in PVM, **117**, 2014 veröffentlicht. Es handelt sich dabei um eine Metastudie. Diese wurde mittels logistischer Regression und generalized estiamtion equations ausgewertet. Es wurde eine Variablenselektion durch geführt: (i) durch univariates filtern (mit logistischer Regression) wurden alle Variablen entfernt, die keinen direkten Einfluss auf die Zielvariable haben, (ii) von paarweise korrelierten Variablen wurde eine der korrelierten Variablen entfernt. Es wurde versucht auch Interaktionsterme zubreücksichtigen. Es wurde nur einer gefunden, auch aufgrund der Anzahl der Datenpunkte Datensatzes. Dieser wurde im finalen Modell nicht weiter berücksichtigt.
+
+# Notwendige Pakte und eigene Funktionen
+
+Hier verwendete Pakete.
+```{r libraries, warning=FALSE, message=FALSE}
+library(magrittr)
+library(caret)
+library(evtree)
+library(pROC)
+```
+
+# Datenvorbereitung
+
+## Einlesen und Vorbereiten der Daten.
+
+Einlesen und Bereinigung der Daten. Es wird sichergestellt, dass alle Daten einen R-konformen Namen haben und als Faktoren vorliegen. die Variablennamen erhalten die Namen aus dem Paper.
+Einige der Kategorien der Variablen werden besser lesbar gestaltet.
+
+```{r read_data}
+MRSA_schweineherden <- read.csv(file = file.choose(),
+                                header = TRUE)
+
+# all categorigal variables needs to be checked if there name is valid in R
+# E. g.: TRUE and FALSE are not; TRUE. and FALSE. are
+# All categorical Variables need to be (at least) described as factors
+for (i in seq( ncol(MRSA_schweineherden) )) {
+  MRSA_schweineherden[[i]] <- make.names(MRSA_schweineherden[[i]])
+  MRSA_schweineherden[[i]] <- factor(MRSA_schweineherden[[i]])
+}
+
+# the old names in the data set are renamed, so they match the names in the 
+# paper
+new_col_names <- list(HerdMRSA                = 'HERD_MRSA',
+                      HerdTypeNum             = 'HERD_TYPE',
+                      FeedingPlacesMinGrouped = 'HERD_SIZE',
+                      PurchaseBin             = 'PURCHASE',
+                      AntibioticsFrom10W      = 'AM_DRUG',
+                      AllInAllOut             = 'ALL_IN_or_OUT',
+                      Cleanup                 = 'CLEAN_UP',
+                      Disinfection            = 'DISINFECTION',
+                      SlattedFloor            = 'SLATTED',
+                      OrganicFarm             = 'ORGANIC',
+                      OtherLivestockAtFarmBin = 'OTHER_LIVESTOCK',
+                      CompanionAnimalsBin     = 'COMPANION',
+                      IndoorHousing           = 'INDOOR')
+
+# rename the column names
+column_names <- colnames(MRSA_schweineherden)
+for (col_name in column_names)
+  colnames(MRSA_schweineherden)[column_names == col_name] <- new_col_names[[col_name]]
+
+# replace old variable types for variable HERD_SIZE
+levels(MRSA_schweineherden$HERD_SIZE)
+levels(MRSA_schweineherden$HERD_SIZE) <- c('huge', 'small', 'large', 'medium')
+
+# reorder factors
+MRSA_schweineherden$HERD_SIZE <- factor(MRSA_schweineherden$HERD_SIZE, 
+                                        levels = c('small', 'medium', 
+                                                   'large', 'huge'),
+                                        ordered = TRUE)
+levels(MRSA_schweineherden$HERD_SIZE)
+
+levels(MRSA_schweineherden$HERD_TYPE)
+levels(MRSA_schweineherden$HERD_TYPE) <- c("farrow", "grower", "weaner")
+levels(MRSA_schweineherden$HERD_TYPE)
+
+# replace old variable types for variable SLATTED_AT_LEAST_PARTIALLY
+levels(MRSA_schweineherden$SLATTED)
+levels(MRSA_schweineherden$SLATTED) <- c('no', 'yes')
+levels(MRSA_schweineherden$SLATTED)
+```
+
+## Vorstellung des Datensatzes (EDA)
+
+```{r print_head}
+head(MRSA_schweineherden)
+```
+
+Bestimmung der Anzahl der Datenpunkte, Anzahl Variablen und Verteilung der Response.
+
+```{r print_EDA}
+MRSA_schweineherden$HERD_MRSA %>% length -> number_of_datapoints
+MRSA_schweineherden[1,-1] %>% length -> number_of_variables
+MRSA_schweineherden$HERD_MRSA %>% summary
+MRSA_schweineherden$HERD_MRSA %>% summary  %>% pie(.,main = 'HERD MRSA')
+```
+
+Datenpunkte=`r number_of_datapoints`, Variablen=`r number_of_variables`.
+
+```{r mosaic_plot, echo=FALSE}
+par(mfrow = c(3,4))
+
+column_names <- colnames(MRSA_schweineherden)
+write_ylabel <- TRUE
+m <- 1
+for (i in seq(2,13)) 
+{
+   tmp <- cbind.data.frame(x = MRSA_schweineherden[[i]],
+                           y = MRSA_schweineherden$HERD_MRSA)
+   
+   tmp <- table(tmp)
+
+   if (write_ylabel)
+      ylabel <- 'MRSA'
+   else
+      ylabel <- ''
+
+   mosaicplot(tmp,
+              main = column_names[i],
+              ylab = ylabel,
+              xlab = '',
+              color = c('white','red'))
+   
+   m <- m + 1
+   if (m == 5)
+   {
+      m <- 1
+      write_ylabel <- TRUE
+   }
+   else
+   {
+      write_ylabel <- FALSE
+   }
+}
+```
+
+Sind einige der Kategorien der Variablen zu dünn besetzt?
+
+```{r near zero Variance}
+nearZeroVar(MRSA_schweineherden, saveMetrics = TRUE)
+```
+
+Die Variable INDOOR besteht fast ausschließlich aus Herden, die indoor leben, fast keine die outdoor sind. Dadurch haben wir eine near-zero-variance (nzv) für diese Variable. Wir entfernen diese Variable daher.
+
+```{r remove Indoor}
+MRSA_schweineherden_reduced <- MRSA_schweineherden
+MRSA_schweineherden_reduced$INDOOR <- NULL
+```
+
+# Erstes Model
+
+```{r first model}
+start_time <- Sys.time()
+first_model <- evtree(HERD_MRSA ~ .,
+                      data = MRSA_schweineherden_reduced,
+                      control = evtree.control(niterations = 100000L,
+                                               ntrees = 5000L,
+                                               seed = -1L,
+                                               minbucket = 10L,
+                                               minsplit = 20L))
+print(Sys.time() - start_time)
+print(first_model)
+confusionMatrix(data = predict(first_model), 
+                reference = MRSA_schweineherden$HERD_MRSA,
+                positive = "positive")
+plot(first_model)
+```
+

@@ -1,0 +1,820 @@
+---
+title: "MRSA Klassifizierung in Schweinemastherden mit *glmnet*"
+author: "Dr. Robert Opitz"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+     reference_docx: "BfR-styles-reference.docx"
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Der MRSA-Datensatz in Schweinemastherden wurde von Fromm *et al.* in PVM, **117**, 2014 veröffentlicht. Es handelt sich dabei um eine Metastudie. Diese wurde mittels logistischer Regression und generalized estiamtion equations ausgewertet. Es wurde eine Variablenselektion durch geführt: (i) durch univariates filtern (mit logistischer Regression) wurden alle Variablen entfernt, die keinen direkten Einfluss auf die Zielvariable haben, (ii) von paarweise korrelierten Variablen wurde eine der korrelierten Variablen entfernt. Es wurde versucht auch Interaktionsterme zubreücksichtigen. Es wurde nur einer gefunden, auch aufgrund der Anzahl der Datenpunkte Datensatzes. Dieser wurde im finalen Modell nicht weiter berücksichtigt.  
+
+# Notwendige Pakte und eigene Funktionen
+
+Hier verwendete Pakete.
+```{r libraries, warning=FALSE, message=FALSE}
+library(magrittr)
+library(caret)
+library(glmnet)
+library(pROC)
+library(foreach)
+library(doParallel)
+library(latex2exp)
+
+number_of_threads <- parallel::detectCores() # 6
+set.seed(42)
+
+# make a cluster of 4 cores for foreach
+cl <- makeCluster(number_of_threads)
+registerDoParallel(cl)
+```
+
+Wir verwenden heir eine eigene Funktion zur Corss-Validierung von glmnet. 
+
+```{r my_glment_cv_function}
+my_glmnet_cv <- function(formula,
+                         data,
+                         train_index,
+                         alpha_seq = c(1), lambda_seq = NULL,
+                         type = 'ungrouped') 
+{
+   # bestimme Response aus der Formel
+   response_data <- data[[ all.vars(formula)[1] ]]
+     
+   # lambda muss decreasing sein
+   lambda_seq <- sort(lambda_seq, decreasing = TRUE)
+
+   # length of train_index, alpha and lambda sequence
+   number_of_train_sets <- length(train_index)
+   n <- length(alpha_seq)
+   m <- length(lambda_seq)
+
+   # umgekehrter index zur sortierung der AUC Werte
+   lambda_index <- length(lambda_seq):1
+   
+   # get all the AUC for variations of alpha and lambda
+   # for all training and test data sets
+   result <- foreach(j = 1:number_of_train_sets,                                 
+                     .packages = c('glmnet', 'pROC'),
+                     .errorhandling = 'pass',
+                     .verbose = FALSE) %dopar% {
+     
+      # get the current index from the train index list
+      index <- train_index[[j]]
+     
+      # Datenaufteilung und Erstellung der Designmatrix
+      x_train <- model.matrix(formula, data[ index, ])
+      x_test  <- model.matrix(formula, data[-index, ])
+
+      y_train <- response_data[ index]
+      y_test  <- response_data[-index]
+      
+      # intialize the grid matrix to collect all the computed AUC values
+      # for this particular training and test data set
+      auc_test  <- matrix(0.0, ncol = n, nrow = m)
+      acc_test  <- matrix(0.0, ncol = n, nrow = m)
+
+      # flag indicating, if glmnet failed, and the results for this 
+      # training set will be discarded
+      error <- FALSE
+      
+      # build the model for the current train data,
+      # with the current values of alpha and the used lambda sequence
+      for (i in seq_len(n) ) 
+      {
+         # build the model
+         trained_model <- glmnet(x = x_train,
+                                 y = y_train,
+                                 family = c("binomial"),
+                                 standardize = FALSE, # not necessary
+                                 intercept = FALSE, # we use a design matrix
+                                 alpha = alpha_seq[i],
+                                 lambda = lambda_seq,
+                                 maxit = 10^6 )
+         
+         if (trained_model$jerr != 0) 
+         {
+            error <- TRUE
+            break
+         }
+         
+         # store AUC values for test data
+         auc_test[,i] <- apply(predict(trained_model, 
+                                        newx = x_test, 
+                                        type = 'response'), 
+                               2, 
+                               function(x, y_data) 
+                               {
+                                   tryCatch( auc( roc( y_data, x ) ),
+                                             error = function(e) 0.5 )
+                               }, 
+                               y_test )
+         
+         acc_test[,i] <- apply(predict(trained_model,
+                                       newx = x_test,
+                                       type = 'class'),
+                               2,
+                               function(pred_class, y_class) 
+                               {
+                                  conf_table <- table(y_class, pred_class)
+                                  sum(diag(conf_table)) / sum(conf_table)
+                               },
+                               y_test)
+         
+      }
+      # output object for foreach
+      # the rows get re-orderd, as glmnet needs decreasing lambda values
+      if (error)
+         NULL
+      else
+         list(auc = auc_test[lambda_index,],
+              acc = acc_test[lambda_index,])
+   }
+   
+   # clean result list of foreach from unsuccsessful trained models 
+   # (they are NULL)
+   result <- Filter(Negate(is.null), result)
+   number_of_succesful_models <- length(result)
+   
+   if (number_of_succesful_models != number_of_train_sets)
+      warning(paste('Only', number_of_succesful_models, 
+                    'successful runs out of', number_of_train_sets, "\n"))
+   
+   auc_test_list <- lapply(result, function(x) x$auc)
+   acc_test_list <- lapply(result, function(x) x$acc)
+   
+   # average of Test AUC for all successful trained models
+   ave_auc_test <- Reduce('+', auc_test_list) / number_of_succesful_models
+   ave_acc_test <- Reduce('+', acc_test_list) / number_of_succesful_models
+   
+   list(ave_auc_test = ave_auc_test,
+        ave_acc_test = ave_acc_test)
+}
+```
+
+Hilfsfunktion fürs Plotten.
+
+```{r other_functions}
+plot_func <- function(model_fit_response, reference, title = "") 
+{
+  lev <- levels(reference)
+  threshold <- seq(0, 1, 0.01)
+  n <- length(threshold)
+  acc <- rep(NA, n)
+  sen <- rep(NA, n)
+  spe <- rep(NA, n)
+  bacc <- rep(NA, n)
+  for (i in seq(n))
+  {
+    pred_class <- factor(ifelse(model_fit_response <= threshold[i], 
+                                lev[1], lev[2]),
+                         levels = lev)
+    confMat <- caret::confusionMatrix(data = pred_class,
+                                      reference = reference)
+  
+    acc[i] <- confMat$overall[["Accuracy"]]
+    sen[i] <- confMat$byClass[["Sensitivity"]]
+    spe[i] <- confMat$byClass[["Specificity"]]
+    bacc[i] <- confMat$byClass[["Balanced Accuracy"]]
+  }
+
+  plot(threshold, acc, 
+       type = "l",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       ylab = "Acc/Sen/Spe/bal. Acc",
+       main = title)
+  lines(threshold, sen,  col = "red")
+  lines(threshold, spe,  col = "blue")
+  lines(threshold, bacc, col = "green")
+  abline(v = 0.5, lty = 4)
+  cat("Max. Acc = ", max(acc), 
+      " at Threshold = ", threshold[which.max(acc)], "\n")
+  abline(v = thres <- threshold[which.max(bacc)], lty = 2)
+  cat("Max. bal. Acc = ", max(bacc), " at Threshold = ", thres, "\n")
+  # no information criteria
+  tmp <- summary(reference)
+  no_info <- max(tmp) / sum(tmp)
+  abline(h = no_info, lty = 3)
+
+  plot(1 - spe, sen, 
+       type = "l", 
+       main = paste("ROC", title), 
+       lwd = 5)
+  abline(a = 0, b = 1, lty = 2)
+  abline(a = 1, b = -1, lty = 3)
+
+  print(pROC::roc(reference, model_fit_response))
+
+  plot(1 - spe, sen + spe - 1,
+       ylim = c(0,1),
+       type = "l",
+       ylab = "J = sen + spe - 1",
+       main = paste("Youden's J", title), 
+       lwd = 5)
+  abline(a = 1, b = -1, lty = 2)
+  max_youden_j <- which.max(sen + spe - 1)
+  cat("Sen = ", sen[max_youden_j], 
+      "; Spe = ", spe[max_youden_j], 
+      "; threshold = ", threshold[max_youden_j], "\n")
+  abline(v = 1 - sen[max_youden_j], lty = 3)
+  
+  return(thres)
+}
+
+plot_weights_of_feature <- function(weights_list, feature_name)
+{
+  weights <- sapply(weights_list, 
+                    function(x, feature_name) x[feature_name,], 
+                    feature_name)
+  hist(weights,
+       main = paste("Weight distribution for", feature_name),
+       breaks = 100,
+       probability = TRUE)
+  invisible(NULL)
+}
+```
+
+# Datenvorbereitung
+
+## Einlesen und Vorbereiten der Daten.
+
+Einlesen und Bereinigung der Daten. Es wird sichergestellt, dass alle Daten einen R-konformen Namen haben und als Faktoren vorliegen. die Variablennamen erhalten die Namen aus dem Paper.
+Einige der Kategorien der Variablen werden besser lesbar gestaltet.
+
+```{r read_data}
+MRSA_schweineherden <- read.csv(file = file.choose(),
+                                header = TRUE )
+
+# all categorigal variables needs to be checked if there name is valid in R
+# E. g.: TRUE and FALSE are not; TRUE. and FALSE. are
+# All categorical Variables need to be (at least) described as factors
+for (i in seq_len(ncol(MRSA_schweineherden))) {
+  MRSA_schweineherden[[i]] <- make.names(MRSA_schweineherden[[i]])
+  MRSA_schweineherden[[i]] <- factor(MRSA_schweineherden[[i]])
+}
+
+# the old names in the data set are renamed, so they match the names in the paper
+new_col_names <- list(HerdMRSA                = 'HERD_MRSA',
+                      HerdTypeNum             = 'HERD_TYPE',
+                      FeedingPlacesMinGrouped = 'HERD_SIZE',
+                      PurchaseBin             = 'PURCHASE',
+                      AntibioticsFrom10W      = 'AM_DRUG',
+                      AllInAllOut             = 'ALL_IN_or_OUT',
+                      Cleanup                 = 'CLEAN_UP',
+                      Disinfection            = 'DISINFECTION',
+                      SlattedFloor            = 'SLATTED',
+                      OrganicFarm             = 'ORGANIC',
+                      OtherLivestockAtFarmBin = 'OTHER_LIVESTOCK',
+                      CompanionAnimalsBin     = 'COMPANION',
+                      IndoorHousing           = 'INDOOR')
+
+# rename the column names
+column_names <- colnames(MRSA_schweineherden)
+for (col_name in column_names)
+  colnames(MRSA_schweineherden)[column_names == col_name] <- new_col_names[[col_name]]
+
+# replace old variable types for variable HERD_SIZE
+levels(MRSA_schweineherden$HERD_SIZE)
+levels(MRSA_schweineherden$HERD_SIZE) <- c('huge', 'small', 'large', 'medium')
+
+# reorder factors
+MRSA_schweineherden$HERD_SIZE <- factor(MRSA_schweineherden$HERD_SIZE, 
+                                        levels = c('small', 'medium', 
+                                                   'large', 'huge'),
+                                        ordered = TRUE)
+levels(MRSA_schweineherden$HERD_SIZE)
+
+levels(MRSA_schweineherden$HERD_TYPE)
+levels(MRSA_schweineherden$HERD_TYPE) <- c("farrow", "grower", "weaner")
+levels(MRSA_schweineherden$HERD_TYPE)
+
+# replace old variable types for variable SLATTED_AT_LEAST_PARTIALLY
+levels(MRSA_schweineherden$SLATTED)
+levels(MRSA_schweineherden$SLATTED) <- c('no', 'yes')
+levels(MRSA_schweineherden$SLATTED)
+```
+
+## Vorstellung des Datensatzes (EDA)
+
+```{r print_head}
+str(MRSA_schweineherden)
+```
+
+Bestimmung der Anzahl der Datenpunkte, Anzahl Variablen und Verteilung der Response.
+
+```{r print_EDA}
+MRSA_schweineherden$HERD_MRSA %>% length -> number_of_datapoints
+MRSA_schweineherden[1,-1] %>% length -> number_of_variables
+MRSA_schweineherden$HERD_MRSA %>% summary
+MRSA_schweineherden$HERD_MRSA %>% summary  %>% pie(.,main = 'HERD MRSA')
+```
+
+Datenpunkte=`r number_of_datapoints`, Variablen=`r number_of_variables`.
+
+```{r mosaic_plot, echo=FALSE}
+par(mfrow = c(3,4))
+
+column_names <- colnames(MRSA_schweineherden)
+write_ylabel <- TRUE
+m <- 1
+for (i in seq(2,13)) 
+{
+   tmp <- cbind.data.frame(x = MRSA_schweineherden[[i]],
+                           y = MRSA_schweineherden$HERD_MRSA)
+   
+   tmp <- table(tmp)
+
+   if (write_ylabel)
+      ylabel <- 'MRSA'
+   else
+      ylabel <- ''
+
+   mosaicplot(tmp,
+              main = column_names[i],
+              ylab = ylabel,
+              xlab = '',
+              color = c('white','red'))
+   
+   m <- m + 1
+   if (m == 5) {
+      m <- 1
+      write_ylabel <- TRUE
+   }else{
+      write_ylabel <- FALSE
+   }
+}
+```
+
+```{r near zero Variance}
+nearZeroVar(MRSA_schweineherden, saveMetrics = TRUE)
+```
+
+Die Variable INDOOR besteht fast ausschließlich aus Herden, die indoor leben, fast keine die outdoor sind. Dadurch haben wir eine near-zero-variance (nzv) für diese Variable. Wir entfernen diese Variable daher.
+
+```{r remove Indoor}
+MRSA_schweineherden_reduced <- MRSA_schweineherden
+MRSA_schweineherden_reduced$INDOOR <- NULL
+```
+
+# Set the Training Index
+
+```{r Erstellung_des_CV_trainingsindexes}
+train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+                                k = 10,
+                                times = 100 )
+```
+
+# Hyperparamteroptimierung
+
+## Einfacher Ansatz: Nur alle Hauptterme
+
+### Auswertung mit repeated Cross-validation.
+
+```{r hyperparameteroptimierung_nur_hauptterme}
+# lambda Sequenz für die Formel Herd_MRSA ~ .
+alpha_seq  <- seq(0, 1, 0.01)
+lambda_seq <- seq(0.00001, 0.5, 0.01)
+# Die Formel berücksichtigt alle Terme, aber nur als Hauptterme
+start_time <- Sys.time()
+result_cv_lin <- my_glmnet_cv(formula = HERD_MRSA ~ ., 
+                              data = MRSA_schweineherden_reduced, 
+                              train_index, 
+                              alpha_seq = alpha_seq,
+                              lambda_seq = lambda_seq)
+print(Sys.time() - start_time)
+```
+
+```{r best_hyperparemeter_nur_hauptterme_fuer_AUC}
+best_auc_lin <- max(result_cv_lin$ave_auc_test )
+best_index <- which(result_cv_lin$ave_auc_test == best_auc_lin, 
+                    arr.ind = TRUE )
+
+#best_auc_lin_se <- result_lin$se_auc_test[best_index]
+
+print(best_index)
+
+auc_alpha_lin  <- alpha_seq[ best_index[2] ]
+auc_lambda_lin <- lambda_seq[ best_index[1] ]
+
+cat('The best Test AUC=', round(best_auc_lin, 3), 
+    ' for alpha=', auc_alpha_lin, 'and lambda=', auc_lambda_lin, '.\n')
+```
+
+Es wurde für die Hyperparameter alpha=`r auc_alpha_lin` und lambda=`r auc_lambda_lin` der höchste AUC=`r round(best_auc_lin,3)` gefunden. Die Werte für alpha und lambda lassen sich in lambda1=`r auc_lambda_lin * auc_alpha_lin` und lambda2=`r auc_lambda_lin * (1. - auc_alpha_lin)` umwandeln.
+
+```{r plot_AUC_hyperparameter_optimization_nur_hauptterme, echo=FALSE}
+# plot AUC test vs. alpha and lambda
+filled.contour(x = lambda_seq,
+               y = alpha_seq,
+               z = result_cv_lin$ave_auc_test,
+               nlevels = 50,
+               col = rainbow(70),
+               main = 'Linear model, glmnet, AUC, repeated CV',
+               xlab = TeX('$\\lambda$'),
+               ylab = TeX('$\\alpha$'),
+               plot.axes = {
+                 axis(1); axis(2);
+                 points(auc_lambda_lin,
+                        auc_alpha_lin)
+               })
+```
+
+## Quadratischer Ansatz: Alle Haupt- und Interaktionsterme
+
+```{r Erstellung_des_CV_trainingsindexes}
+#train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+#                                k = 10,
+#                                times = 100 )
+```
+
+```{r hyperparameteroptimierung_haupt_und_interaktionsterme}
+# lambda Sequenz für Formel Herd_MRSA ~ .^2
+alpha_seq <- seq(0,1,0.01)
+lambda_seq <- seq(0.0001,0.3,0.01)
+
+start_time <- Sys.time()
+# Die Formel drückte alle Haupt- und alle Interaktionsterme aus
+result_cv_quad <- my_glmnet_cv(formula = HERD_MRSA ~ .^2, 
+                               data = MRSA_schweineherden_reduced, 
+                               train_index, 
+                               alpha_seq = alpha_seq,
+                               lambda_seq = lambda_seq)
+print(Sys.time() - start_time)
+```
+
+```{r best_hyperparemeter_haupt_und_interaktionsterme_AUC}
+best_auc_quad <- max(result_cv_quad$ave_auc_test)
+best_index <- which(result_cv_quad$ave_auc_test == best_auc_quad, 
+                    arr.ind = TRUE)
+
+print(best_index)
+
+#best_auc_quad_se <- result_quad$se_auc_test[best_index]
+
+auc_alpha_quad  <- alpha_seq[ best_index[2] ]
+auc_lambda_quad <- lambda_seq[ best_index[1] ]
+
+cat('The best Test AUC=', round(best_auc_quad,3), 
+    ' for alpha=', auc_alpha_quad, 'and lambda=', auc_lambda_quad, '.\n')
+#cat('The best Test AUC=', round(best_auc_quad,3), '(', signif(best_auc_quad_se,1),
+#    ') for alpha=', best_alpha_quad, 'and lambda=', best_lambda_quad, '.\n')
+```
+
+Es wurde für die Hyperparameter alpha=`r auc_alpha_quad` und lambda=`r auc_lambda_quad` der höchste AUC=`r round(best_auc_quad,3)` gefunden. Die Werte für alpha und lambda lassen sich in lambda1=`r auc_lambda_quad * auc_alpha_quad` und lambda2=`r auc_lambda_quad * (1. - auc_alpha_quad )` umwandeln.
+
+```{r plot_AUC_hyperparameter_optimization_haupt_und_interaktionsterme, echo=FALSE}
+# plot AUC test vs. alpha and lambda
+filled.contour(x = lambda_seq,
+               y = alpha_seq,
+               z = result_cv_quad$ave_auc_test,
+               nlevels = 50,
+               col = rainbow(70),
+               main = 'Full model, glmnet, AUC, repeated CV',
+               xlab = TeX('$\\lambda$'),
+               ylab = TeX('$\\alpha$'),
+               plot.axes = {
+                  axis(1); axis(2);
+                  points(auc_lambda_quad,
+                         auc_alpha_quad)})
+```
+
+# Gegenüberstellung AUC
+
+```{r}
+result <- data.frame( type_of_formular = c('linear', 'quadratisch'),
+                      auc = round(c(best_auc_lin, best_auc_quad),3)#,
+                      #se = signif(c(best_auc_lin_se, best_auc_quad_se),1)
+                      )
+knitr::kable( result )
+```
+
+# Selected Features for best model
+
+```{r create normal useable interface to glmnet}
+my_glmnet <- function(formula, data, alpha, lambda, family = "binomial")
+{
+  # use formual to create the model matrix
+  y_data <- data[[ all.vars(formula)[1] ]]
+  x_data <- model.matrix(formula, data)
+  # build the model
+  result <- glmnet(x = x_data,
+                   y = y_data,
+                   family = family,
+                   standardize = FALSE, # not necessary
+                   intercept = FALSE, # we use a design matrix
+                   alpha = alpha,
+                   lambda = lambda,
+                   maxit = 10^6)
+  result
+}
+```
+
+```{r}
+alpha_glmnet <- auc_alpha_quad
+lambda_glmnet <- auc_lambda_quad
+my_formula <- HERD_MRSA ~ .^2
+
+trained_models <- lapply(train_index,
+                         function(this_index)
+                         {
+                           df_train <- MRSA_schweineherden_reduced[this_index,]
+                           trained_model <- my_glmnet(my_formula,
+                                                      data = df_train,
+                                                      alpha = alpha_glmnet,
+                                                      lambda = lambda_glmnet)
+                           trained_model
+                         })
+# get predicted probabilities
+pred_prob <- mapply(function(trained_model, train_data, formula)
+                    {
+                      df_test <- MRSA_schweineherden_reduced[-train_data,]
+                      test_design_matrix <- model.matrix(formula, df_test)
+                      predict(trained_model,
+                              newx = test_design_matrix,
+                              type = "response")
+                    }, 
+                    trained_models, train_index,
+                    MoreArgs = list(formula = my_formula))
+pred_prob <- unlist(pred_prob)
+# get references classes of test data
+ref_class <- unlist(lapply(train_index, 
+                    function(x) MRSA_schweineherden_reduced$HERD_MRSA[-x]))
+# plot everything for test data
+plot_func(pred_prob, ref_class)
+```
+
+
+```{r wichtigeste features}
+library(roperators)
+selected_features <- mapply(function(trained_model, train_data, formula)
+                            {
+                            df_test <- MRSA_schweineherden_reduced[-train_data,]
+                            test_design_matrix <- model.matrix(formula, df_test)
+                            predict(trained_model,
+                                    newx = test_design_matrix,
+                                    type = "nonzero")
+                            }, 
+                            trained_models, train_index,
+                            MoreArgs = list(formula = my_formula))
+# get selection frequeincy
+feature_names <- colnames(model.matrix(my_formula, MRSA_schweineherden_reduced))
+features <- rep(0,length(feature_names))
+names(features) <- feature_names
+for (this in selected_features)
+  features[this] %+=% 1
+```
+
+```{r plot frequencies of selected features}
+features <- sort(features, decreasing = TRUE)
+features <- features / max(features)
+plot(features, type = "h", ylab = "feature frequency")
+abline(h = 0.9, lty = 2)
+```
+
+Name the most important Features, i.e. all that appear in at least 9 of 10 cases:
+```{r most_impotant_features_glmnet}
+features[features >= 0.9]
+```
+
+
+# Take a closer look -- predicted distribution of risk, and its parts
+
+Plot the probaility calibration curve
+
+```{r calibration curve test data}
+df_cal <- data.frame(Class = ref_class)
+df_cal$glmnet <- pred_prob
+cal_obj <- caret::calibration(Class ~ glmnet,
+                              data = df_cal,
+                              cuts = 50,
+                              class = "positive")
+plot(cal_obj)
+```
+
+```{r predicted risk distribution}
+my_subset <- function(df_input, selection_rule)
+{
+  selected_col   <- selection_rule[1]
+  selected_value <- selection_rule[2]
+  df_output <- NULL
+  for (i in seq_len(nrow(df_input)))
+  {
+    if (df_input[i,selected_col] == selected_value)
+      df_output <- rbind.data.frame(df_output,
+                                    df_input[i,])
+  }
+  if (!is.null(df_output))
+    colnames(df_output) <- colnames(df_input)
+  df_output
+}
+
+get_risk_subset <- function(df_input, trained_models, 
+                            train_index, subset_list)
+{
+  result <- mapply(function(trained_model, train_data, formula)
+                   {
+                      df_test <- df_input[-train_data,]
+                      for (this_subset in subset_list)
+                      {
+                        df_test <- my_subset(df_test, this_subset)
+                        if (is.null(df_test))
+                          return(NULL)
+                      }
+                      test_design_matrix <- model.matrix(formula, df_test)
+                      predict(trained_model,
+                              newx = test_design_matrix,
+                              type = "response")
+                    },
+                    trained_models, train_index,
+                    MoreArgs = list(formula = my_formula))
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r}
+# original distribution of predicted risk
+org_hist <- hist(pred_prob,
+                 breaks = -1*Reduce("-", range(pred_prob))/0.01,
+                 plot = FALSE)
+
+sub_dist_A <- get_risk_subset(MRSA_schweineherden_reduced,
+                              trained_models, train_index,
+                              list(c("HERD_SIZE", "small"),
+                                   c("SLATTED", "yes")))
+
+sub_dist_B <- get_risk_subset(MRSA_schweineherden_reduced,
+                              trained_models, train_index,
+                              list(c("HERD_SIZE", "small"),
+                                   c("SLATTED", "no")))
+
+# distribution of stratified sample
+sub_dist_A_hist <- hist(sub_dist_A,
+                        breaks = -1*Reduce("-", range(sub_dist_A))/0.01,
+                        plot = FALSE)
+sub_dist_B_hist <- hist(sub_dist_B,
+                        breaks = -1*Reduce("-", range(sub_dist_B))/0.01,
+                        plot = FALSE)
+# plot it all
+plot(org_hist,
+     freq = TRUE,
+     col = rgb(0,0,1,1/4),
+     xlim = c(0,1),
+     xlab = "P(Y=1)",
+     main = "GLMNET")
+plot(sub_dist_A_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(1,0,0,1/4))
+plot(sub_dist_B_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(0,1,0,1/4))
+legend("topleft",
+       legend = c("complete",
+                  "small HERDs, SLATTED floor",#"sub_dist_A",
+                  "small HERDs, no SLATTED floor"),#"sub_dist_B"),
+       col = c(rgb(0,0,1,1/4),
+               rgb(1,0,0,1/4),
+               rgb(0,1,0,1/4)),
+       lty = 1, lwd = 4)
+```
+
+# Change in predicted risk distribution
+
+```{r}
+get_mod_pred_risk <- function(df_input, trained_models, 
+                              train_index, subset_list)
+{
+  col_name <- subset_list[1]
+  new_value <- subset_list[2]
+  result <- mapply(function(trained_model, train_data, formula)
+                   {
+                      df_test <- df_input[-train_data,]
+                      lev <- levels(df_test[[col_name]])
+                      df_test[,col_name] <- factor(rep(new_value, 
+                                                       nrow(df_test)),
+                                                   levels = lev)
+                      test_design_matrix <- model.matrix(formula, df_test)
+                      predict(trained_model,
+                              newx = test_design_matrix,
+                              type = "response")
+                    },
+                    trained_models, train_index,
+                    MoreArgs = list(formula = my_formula))
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r}
+# original distribution of predicted risk
+org_hist <- hist(pred_prob,
+                 breaks = -1*Reduce("-", range(pred_prob))/0.01,
+                 plot = FALSE)
+
+sub_dist_A <- get_mod_pred_risk(MRSA_schweineherden_reduced,
+                                trained_models, train_index,
+                                c("SLATTED", "no"))
+
+# distribution of stratified sample
+sub_dist_A_hist <- hist(sub_dist_A,
+                        breaks = -1*Reduce("-", range(sub_dist_A))/0.01,
+                        plot = FALSE)
+
+# plot it all
+plot(org_hist,
+     freq = TRUE,
+     col = rgb(0,0,1,1/4),
+     xlim = c(0,1),
+     ylim = range(org_hist$counts, sub_dist_A_hist$counts),
+     xlab = "P(Y=1)",
+     main = "predicted risk for GLM")
+plot(sub_dist_A_hist,
+     freq = TRUE,
+     add = TRUE,
+     col = rgb(1,0,0,1/4))
+legend("topleft",
+       legend = c("unchanged",
+                  "no SLATTED floors"),#"sub_dist_A",
+       col = c(rgb(0,0,1,1/4),
+               rgb(1,0,0,1/4)),
+       lty = 1, lwd = 4)
+```
+
+```{r}
+get_mod_pred_prev <- function(df_input, trained_models, 
+                                     train_index, subset_list, threshold)
+{
+  col_name <- subset_list[1]
+  new_value <- subset_list[2]
+  result <- mapply(function(trained_model, train_data, formula, threshold)
+                   {
+                      df_test <- df_input[-train_data,]
+                      lev <- levels(df_test[[col_name]])
+                      df_test[,col_name] <- factor(rep(new_value, 
+                                                       nrow(df_test)),
+                                                   levels = lev)
+                      test_design_matrix <- model.matrix(formula, df_test)
+                      pred <- predict(trained_model,
+                                      newx = test_design_matrix,
+                                      type = "response")
+                      ifelse(pred > threshold, 1, 0)
+                    }, 
+                    trained_models, train_index,
+                    MoreArgs = list(formula = my_formula,
+                                    threshold = threshold))
+  # remove empty entries in result list
+  result <- Filter(Negate(is.null), result)
+  unname(unlist(result)) # simple vector with predicted risks
+}
+```
+
+```{r}
+threshold <- 0.59
+pred_prev <- mapply(function(trained_model, train_data, formula)
+                   {
+                      test_design_matrix <- model.matrix(formula, 
+                                                         MRSA_schweineherden_reduced)
+                      pred <- predict(trained_model,
+                                      newx = test_design_matrix,
+                                      type = "response")
+                      ifelse(pred > threshold, 1, 0)
+                    }, 
+                    trained_models, train_index,
+                    MoreArgs = list(formula = my_formula))
+pred_prev <- mean(unlist(pred_prev))
+
+mod_pred_prev <- get_mod_pred_prev(MRSA_schweineherden_reduced, 
+                                   trained_models,
+                                   train_index,
+                                   c("SLATTED", "no"),
+                                   threshold)
+mod_pred_prev <- mean(mod_pred_prev)
+```
+
+```{r}
+obs_prev <- mean(MRSA_schweineherden_reduced$HERD_MRSA == "positive")
+pie(c(1 - obs_prev, obs_prev),
+    labels = c("negative", "positive"),
+    main = 'observed MRSA prevalence')
+pie(c(1 - pred_prev, pred_prev), 
+    labels = c("negative", "positive"),
+    main = 'predicted MRSA prevalence')
+pie(c(1 - mod_pred_prev, mod_pred_prev), 
+    labels = c("negative", "positive"),
+    main = 'pred. no SLATTED prevalence')
+```
+
+```{r finish_multithread}
+stopCluster(cl)
+```
+
