@@ -26,10 +26,10 @@ library(foreach)
 library(doParallel)
 library(latex2exp)
 
-number_of_threads <- parallel::detectCores() # 6
+number_of_threads <- parallel::detectCores() # use max number of cores
 set.seed(42)
 
-# make a cluster of 4 cores for foreach
+# make a cluster of max number of cores for foreach
 cl <- makeCluster(number_of_threads)
 registerDoParallel(cl)
 ```
@@ -95,7 +95,7 @@ my_glmnet_cv <- function(formula,
                                  intercept = FALSE, # we use a design matrix
                                  alpha = alpha_seq[i],
                                  lambda = lambda_seq,
-                                 maxit = 10^6 )
+                                 maxit = 10^6)
          
          if (trained_model$jerr != 0) 
          {
@@ -234,9 +234,46 @@ plot_weights_of_feature <- function(weights_list, feature_name)
                     feature_name)
   hist(weights,
        main = paste("Weight distribution for", feature_name),
-       breaks = 100,
+       #breaks = 100,
        probability = TRUE)
   invisible(NULL)
+}
+```
+
+Andere Hilfsfunktion
+
+```{r other helper functions}
+# create normal useable interface to glmnet
+my_glmnet <- function(formula, data, alpha, lambda, family = "binomial")
+{
+  # use formual to create the model matrix
+  y_data <- data[[ all.vars(formula)[1] ]]
+  x_data <- model.matrix(formula, data)
+  # build the model
+  result <- glmnet(x = x_data,
+                   y = y_data,
+                   family = family,
+                   standardize = FALSE, # not necessary
+                   intercept = FALSE, # we use a design matrix
+                   alpha = alpha,
+                   lambda = lambda,
+                   maxit = 10^6)
+  result
+}
+
+# get all trained models for a certain alpha and lambda as alist
+get_trained_models <- function(my_formula, df_data, alpha, lambda, 
+                               train_index)
+{
+  lapply(train_index,
+         function(this_index)
+         {
+           df_train <- df_data[this_index,]
+           my_glmnet(my_formula,
+                     data = df_train,
+                     alpha = alpha,
+                     lambda = lambda)
+         })
 }
 ```
 
@@ -364,7 +401,7 @@ MRSA_schweineherden_reduced$INDOOR <- NULL
 
 # Set the Training Index
 
-```{r Erstellung_des_CV_trainingsindexes}
+```{r Erstellung des CV-Trainingsindexes}
 train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
                                 k = 10,
                                 times = 100 )
@@ -425,12 +462,28 @@ filled.contour(x = lambda_seq,
                })
 ```
 
+### Weights
+
+```{r get optimized linear model}
+trained_lin_models <- get_trained_models(HERD_MRSA ~ .,
+                                         MRSA_schweineherden_reduced,
+                                         auc_alpha_lin, auc_lambda_lin, 
+                                         train_index)
+```
+
+```{r get weight list and plot some histograms for linear model}
+weight_list <- lapply(trained_lin_models, function(x) x$beta)
+plot_weights_of_feature(weight_list, "HERD_SIZE.L")
+plot_weights_of_feature(weight_list, "SLATTEDyes")
+plot_weights_of_feature(weight_list, "ORGANICyes")
+```
+
 ## Quadratischer Ansatz: Alle Haupt- und Interaktionsterme
 
-```{r Erstellung_des_CV_trainingsindexes}
-#train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
-#                                k = 10,
-#                                times = 100 )
+```{r Erstellung des CV Trainingsindexes full model}
+train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+                                k = 10,
+                                times = 10)
 ```
 
 ```{r hyperparameteroptimierung_haupt_und_interaktionsterme}
@@ -455,15 +508,11 @@ best_index <- which(result_cv_quad$ave_auc_test == best_auc_quad,
 
 print(best_index)
 
-#best_auc_quad_se <- result_quad$se_auc_test[best_index]
-
 auc_alpha_quad  <- alpha_seq[ best_index[2] ]
 auc_lambda_quad <- lambda_seq[ best_index[1] ]
 
 cat('The best Test AUC=', round(best_auc_quad,3), 
     ' for alpha=', auc_alpha_quad, 'and lambda=', auc_lambda_quad, '.\n')
-#cat('The best Test AUC=', round(best_auc_quad,3), '(', signif(best_auc_quad_se,1),
-#    ') for alpha=', best_alpha_quad, 'and lambda=', best_lambda_quad, '.\n')
 ```
 
 Es wurde für die Hyperparameter alpha=`r auc_alpha_quad` und lambda=`r auc_lambda_quad` der höchste AUC=`r round(best_auc_quad,3)` gefunden. Die Werte für alpha und lambda lassen sich in lambda1=`r auc_lambda_quad * auc_alpha_quad` und lambda2=`r auc_lambda_quad * (1. - auc_alpha_quad )` umwandeln.
@@ -495,41 +544,15 @@ knitr::kable( result )
 ```
 
 # Selected Features for best model
-
-```{r create normal useable interface to glmnet}
-my_glmnet <- function(formula, data, alpha, lambda, family = "binomial")
-{
-  # use formual to create the model matrix
-  y_data <- data[[ all.vars(formula)[1] ]]
-  x_data <- model.matrix(formula, data)
-  # build the model
-  result <- glmnet(x = x_data,
-                   y = y_data,
-                   family = family,
-                   standardize = FALSE, # not necessary
-                   intercept = FALSE, # we use a design matrix
-                   alpha = alpha,
-                   lambda = lambda,
-                   maxit = 10^6)
-  result
-}
-```
-
 ```{r}
 alpha_glmnet <- auc_alpha_quad
 lambda_glmnet <- auc_lambda_quad
 my_formula <- HERD_MRSA ~ .^2
 
-trained_models <- lapply(train_index,
-                         function(this_index)
-                         {
-                           df_train <- MRSA_schweineherden_reduced[this_index,]
-                           trained_model <- my_glmnet(my_formula,
-                                                      data = df_train,
-                                                      alpha = alpha_glmnet,
-                                                      lambda = lambda_glmnet)
-                           trained_model
-                         })
+trained_models <- get_trained_models(my_formula,
+                                     MRSA_schweineherden_reduced,
+                                     alpha_glmnet, lambda_glmnet,
+                                     train_index)
 # get predicted probabilities
 pred_prob <- mapply(function(trained_model, train_data, formula)
                     {
@@ -582,6 +605,14 @@ Name the most important Features, i.e. all that appear in at least 9 of 10 cases
 features[features >= 0.9]
 ```
 
+# Distribution of weights
+
+```{r get weight list and plot some histograms for full model}
+weight_list <- lapply(trained_models, function(x) x$beta)
+plot_weights_of_feature(weight_list, "HERD_SIZE.L")
+plot_weights_of_feature(weight_list, "OTHER_LIVESTOCKyes")
+plot_weights_of_feature(weight_list, "PURCHASEyes:SLATTEDyes")
+```
 
 # Take a closer look -- predicted distribution of risk, and its parts
 

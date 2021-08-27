@@ -181,30 +181,39 @@ barplot(feature_importance_rpart,
         las = 1)
 ```
 
-# Leave-one-out crossvalidation Kreuzvaliderung ()
+# Kreuzvaliderung
 
-The leave-one-out Kreuzvalidierung (LOOCV) ist eine Form des *jackknife*.
+Erstelle den Trainingsindex.
 
-```{r LOOCV}
-pred_class <- sapply(seq_len(nrow(MRSA_schweineherden_reduced)),
-                     function(i, data_set)
+```{r Erstellung_des_CV_trainingsindexes}
+train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+                                k = 10,
+                                times = 100)
+```
+
+Kreuzvalidierung
+
+```{r CV}
+pred_class <- sapply(train_index,
+                     function(training_rows, data_set)
                      {
-                      df_train <- data_set[-i,]
-                      df_test  <- data_set[ i,]
-  
+                      df_train <- data_set[ training_rows,]
+                      df_test  <- data_set[-training_rows,]
                       trained_model <- rpart(HERD_MRSA ~ .,
                                              data = df_train,
                                              method = "class",
                                              control = rpart.control(
                                                         minsplit = 20L,
                                                         minbucket = 10L))
-  
                       predict(trained_model,
                               newdata = df_test,
                               type = "class")
                      }, MRSA_schweineherden_reduced)
-
-caret::confusionMatrix(data = pred_class,
-                       reference = MRSA_schweineherden_reduced$HERD_MRSA,
-                       positive = "positive")
+pred_class <- unlist(pred_class)
+actual_class <- unlist(lapply(train_index,
+                              function(x)
+                                 MRSA_schweineherden_reduced$HERD_MRSA[-x]))
+confusionMatrix(data = pred_class,
+                reference = actual_class,
+                positive = "positive")
 ```

@@ -283,7 +283,7 @@ hist(pred_prob,
      xlab = "P(HERD_MRSA = positive)")
 ```
 
-# Kreuzvalidierung
+# Repeqted Crossvalidation
 
 ```{r Erstellung_des_CV_trainingsindexes}
 train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
@@ -315,6 +315,24 @@ ref_class <- unlist(lapply(train_index,
                     function(x) MRSA_schweineherden_reduced$HERD_MRSA[-x]))
 # plot everything for test data
 plot_func(pred_prob, ref_class)
+```
+
+# Distribution of weights in all training models
+
+```{r get weights from all training models}
+df_weights <- NULL
+for (trained_model in trained_models)
+  df_weights <- rbind.data.frame(df_weights,
+                                 coef(trained_model))
+colnames(df_weights) <- names(coef(trained_models[[1]]))
+```
+
+Plot some weight distributions
+
+```{r plotting weights}
+hist(df_weights$HERD_SIZE.L, main = "Weight distribution HERD_SIZE.L")
+hist(df_weights$SLATTEDyes, main = "Weight distribution of SLATTEDyes")
+hist(df_weights$ORGANICyes, main = "Weight distribution of ORGANICyes")
 ```
 
 # Take a closer look -- predicted distribution of risk, and its parts

@@ -173,3 +173,62 @@ confusionMatrix(data = predict(first_model),
 plot(first_model)
 ```
 
+# Kreuzvalidierung
+
+Die Kreuzvalideriung ist sehr rechen- und damit zeitaufwendig. Daher parallelisieren wir mit dem Paekt *parallel*.
+Im ersten chunk sind die Vorbereitungen zur Paralleliserung.
+
+```{r CV vorbereitung}
+library(parallel)
+number_of_threads <- detectCores() # use all cores available
+# make a cluster of 6 cores for parSapply
+cl <- makeCluster(number_of_threads)
+clusterEvalQ(cl = cl, library(evtree)) #  load library into cluster
+```
+
+Der Trainingsindex wird erstellt. Damit werden die Trainings- und Testdaten erzeugt. Hier wird eine 10-fache Kreuzvalidierung verwendet, ohne Wiederholung, um den Rechenaufwand gering zu halten.
+
+```{r Erstellung_des_CV_trainingsindexes}
+train_index <- createMultiFolds(MRSA_schweineherden_reduced$HERD_MRSA,
+                                k = 10,
+                                times = 5)
+```
+
+Die eigentlich Kreuzvalidierung. Zur Parallelisierung wird die paralleliserte Version von *lapply* verwendet. Da *parLapply* eine Liste zurück gibt, aber ein Vektor gebraucht wird, wird *pred_class* in einen Vektor umgewandelt.
+
+```{r Kreuzvalidierung}
+start_time <- Sys.time()
+pred_class <- parLapply(cl = cl,
+                        train_index,
+                        function(training_rows, data_set)
+                        {
+                         df_train <- data_set[ training_rows,]
+                         df_test  <- data_set[-training_rows,]
+                         trained_model <- evtree(HERD_MRSA ~ .,
+                                                 data = df_train,
+                                 control = evtree.control(niterations = 100000L,
+                                                          ntrees = 5000L,
+                                                          seed = -1L,
+                                                          minbucket = 10L,
+                                                          minsplit = 20L))
+                         predict(trained_model,
+                                 new = df_test)
+                        }, data_set = MRSA_schweineherden_reduced)
+pred_class <- unlist(pred_class)
+actual_class <- unlist(lapply(train_index, 
+                              function(x) 
+                                MRSA_schweineherden_reduced$HERD_MRSA[-x]))
+print(Sys.time() - start_time)
+```
+
+Die Konfusionsmatrix und weitere Statisken werden erzeugt.
+
+```{r print cv results}
+confusionMatrix(data = pred_class,
+                reference = actual_class, 
+                positive = "positive")
+```
+
+```{r stop cluster}
+stopCluster(cl)
+```
